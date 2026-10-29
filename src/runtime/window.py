@@ -1541,13 +1541,15 @@ class PetWindow(QWidget):
         pad = 6.0 * s
         return (bx - pad) <= pos.x() <= (bx + bw + pad) and (by - pad) <= pos.y() <= (by + bh + pad)
 
-    def load_next_action(self):
+    def load_next_action(self, force=False):
         # ★ 拖拽与飞行期间不换动作：拖拽最高优先级，飞行中也不该被随机动作打断。
         if self.drag_on or self.phys_timer.isActive():
             return
         # ★ 完整播放保护：当前动作还没播完 → 记下"待续"，等 ended 时再抽。
         #   （召唤散开、抛掷落地等自动路径都走这里，不能中途换掉正在播的动作）
-        if self._action_incomplete():
+        #   force=True 是唯一例外：召唤缓冲到期要"全体同时散开"，
+        #   等待机整段播完会让 10 只的散开时刻各不相同，爆发感就没了。
+        if not force and self._action_incomplete():
             self._pending_next = True
             return
         self._last_action_switch_t = time.monotonic()
@@ -3104,11 +3106,25 @@ class PetWindow(QWidget):
             self.force_action(bal_anims[idx], interrupt=True)
 
     def _end_spawn_hold(self):
-        """召唤缓冲结束：允许抽下一个动作（此刻若已叠在一起，预输入已记下意图）。"""
+        """召唤缓冲到期：**立刻**散开（不等当前待机播完）。
+
+        历史坑（2026-10-30 修）：早期实现只把 _spawn_hold_until 清零再调
+        load_next_action()，结果被 `_action_incomplete()` 的"完整播放保护"挡下
+        → 待机整段（约 10 秒）播完才动，中途 `_pending_force_roam_at` 的
+        2500ms TTL 还过期了 → 观感是"2 秒到了却一直发呆"，四散奔逃消失。
+        现在 force=True 直接打断，并当场写入 roam 意图，保证 2 秒整全体一起跑。
+        """
         try:
             self._spawn_hold_until = 0.0
-            if not self._move_loading:
-                self.load_next_action()
+            self._pending_next = False
+            if self._move_loading:
+                # 缓冲期内待机的第一批帧还没解出来（罕见）：等它开播后再兑现
+                self._pending_next = True
+                return
+            # 强制造 roam 意图：此刻全员叠在屏幕正中，overlap 破表，
+            # 配合 _first_move_random 的 360° 随机方向 → 起手就是四散奔逃。
+            self._pending_force_roam_at = time.monotonic() * 1000.0
+            self.load_next_action(force=True)
         except RuntimeError:
             pass  # 窗口在缓冲期内被销毁时，QTimer.singleShot 仍会触发一次
 
