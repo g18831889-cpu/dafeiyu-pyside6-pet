@@ -1,0 +1,10 @@
+- insert:
+    - id: dsh-pet-pyside6
+      name: dsh-pet-pyside6
+      config:
+        enabled: true
+        autoStart: true
+        port: 3080
+        balanceEnabled: true
+        balanceSource: auto
+        forwardEvents: true

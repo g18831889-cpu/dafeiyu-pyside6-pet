@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "PySide6 Desktop Pet",
+    "description": "Connects the pet-pyside6 desktop pet to DSH: reuses a running pet instead of spawning a duplicate, forwards session status events, and pushes DeepSeek balance to the pet."
+  }
+}

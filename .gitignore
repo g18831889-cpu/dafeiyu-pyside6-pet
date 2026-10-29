@@ -1,0 +1,31 @@
+# 帧素材：834 MB，不适合入库；且动画资源受上游禁商用条款约束
+frames/
+
+# 配置里有本机动作池，用户自备
+config.jsonc
+
+# 运行时产物
+__pycache__/
+*.pyc
+*.pyo
+logs/
+*.log
+
+# 旧备份
+*.bak-*
+*.bak
+
+# 开发工具与产物（不在仓库范围内）
+工具/
+_t_realwin.py
+
+# 用户层设置
+user_settings.json
+
+# 插件依赖（第三方，用 pnpm install 装）
+dsh-plugin/node_modules/
+
+# 系统垃圾
+Thumbs.db
+desktop.ini
+.DS_Store
