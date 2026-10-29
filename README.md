@@ -155,19 +155,38 @@ python main.py
 就这两步。**不需要安装 DeepSeek Harness，不需要 API key，不联网也能跑。**
 想让它跟 DSH 联动，再去装 `dsh-plugin/`（见上文），不装就只是个单纯的桌宠。
 
+## 两种用法
+
+### 方式 A：下载现成的完整包（推荐，不想折腾就选这个）
+
+去 [Releases](https://github.com/g18831889-cpu/dafeiyu-pyside6-pet/releases) 下载
+**`DaFeiyuPet-v1.0.0-win64.zip`**（约 779 MB）：
+
+1. 解压，得到一个 `大肥鱼桌宠` 文件夹，放到哪都行
+2. 装依赖（只需一次）：`python -m pip install PySide6`
+   或者在文件夹里跑 `python -m pip install -r requirements.txt`
+3. 双击 **`启动桌宠.bat`**
+
+包里已经带齐 `frames/`（106 个动作 / 25 400 帧）、`config.jsonc`、全部源码、
+`dsh-plugin/`、技能外挂和 `使用指导.md` —— **不用 git，不用再去别处补素材，解压完就能跑。**
+
+### 方式 B：clone 源码自己搭
+
+`git clone` 下来只有源码（几 MB），动画素材要另外从 Releases 补。见下面一节。
+
 ## 素材说明（重要）
 
-**git 仓库里只有源码，动画素材单独放在 [Releases](https://github.com/g18831889-cpu/dafeiyu-pyside6-pet/releases) 里。** 原因有二：
+**git 仓库里只有源码，`frames/` 与 `config.jsonc` 不在仓库内。** 原因有二：
 
 1. 帧素材有 834 MB（`frames/`，106 个动作 / 25 400 张 WebP），超过 GitHub 单文件 100 MB 的限制，塞进 git 会让克隆变得极慢；
 2. 动画资源有独立的授权条款，见下节。
 
-### 下载素材
+### 手动补齐素材
 
-去 [Releases 页面](https://github.com/g18831889-cpu/dafeiyu-pyside6-pet/releases) 下 `frames.zip`（约 770 MB），解压后把得到的 `frames/` 目录放到项目根目录（和 `main.py` 同级）即可。
+从方式 A 的完整包里直接拿 `frames/` 和 `config.jsonc` 放到项目根目录（和 `main.py` 同级）即可。
 
-另外还需要一份 `config.jsonc`（动作池、权重、移动分级），格式见下面的配置查找顺序。
-程序会依次在这些位置找配置（后两个只是兼容旧安装路径的兜底，与 DSH 是否安装无关）：
+`config.jsonc` 是动作池、权重、移动分级。如果项目根目录没有它，程序会依次去这些位置找
+（后两个只是兼容旧安装路径的兜底，与 DSH 是否安装无关）：
 
 ```
 ./config.jsonc
@@ -191,7 +210,7 @@ python main.py
 ```
 main.py                 启动入口（含系统托盘）
 config.jsonc            动作池 / 权重 / 移动分级（不在本仓库）
-frames/                 帧素材（不在 git 里，见 Releases 的 frames.zip）
+frames/                 帧素材（不在 git 里，见 Releases 的完整包）
 src/
   host/                 配置加载、HTTP 事件服务、日志、开机自启、技能开关
   runtime/              窗口绘制、气泡、解码线程、帧缓存
@@ -235,7 +254,7 @@ python -m pytest tests/ -q
 
 - 只在 Windows 上验证过
 - 倾斜与 Q 弹依赖 `paintEvent` 里的复合变换，群体模式下只有主体会晃（子体保持静止，省 CPU）
-- 素材要另外从 Releases 下 `frames.zip`，不能 clone 完直接跑，见上文「素材说明」
+- clone 仓库只拿到源码，素材要另外从 Releases 的完整包里取，见上文「素材说明」
 - DSH 联动只对 DeepSeek Harness 生效；换成别的编辑器/IDE，桌宠会退化成纯桌宠（这是设计如此，不是缺陷）
 
 ## License
