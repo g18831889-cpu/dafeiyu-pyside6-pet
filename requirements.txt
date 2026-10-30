@@ -1,0 +1,9 @@
+# 大肥鱼桌宠 运行依赖
+# 安装： python -m pip install -r requirements.txt
+PySide6>=6.5
+
+# 可选：Pillow（PIL）
+#   装上之后，摇晃倾斜的每一帧用 BICUBIC 重采样预渲染，高频保留约 97%，
+#   和"不摇晃"时肉眼无差；不装会自动退回 Qt 内置双线性，画质约 71%。
+#   只影响摇晃时的清晰度，不影响任何功能。
+# pillow>=9.0

@@ -229,7 +229,7 @@ def start_stdio_server(proxy_to=None):
                         "result": {
                             "protocolVersion": "2024-11-05",
                             "capabilities": {"resources": {}, "tools": {}},
-                            "serverInfo": {"name": "pyside6-pet", "version": "1.0.0"}
+                            "serverInfo": {"name": "pyside6-pet", "version": "1.0.1"}
                         }
                     })
                 elif method == 'notifications/initialized':

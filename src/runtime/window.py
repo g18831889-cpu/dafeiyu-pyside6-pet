@@ -1,4 +1,5 @@
 """src/runtime/window.py - 桌宠渲染窗口（完美拖拽与悬停版）"""
+import os
 import time
 import math
 import random
@@ -17,8 +18,46 @@ from src.shared.physics import (update_physics, landing_squash, squash_scale,
                                 SQ_DURATION_MS, SQ_SQUASH)
 from src.shared.flock import (steer_target, speed_up_for, roam_chance_for_overlap,
                               overlap_ratio, resolve_push, separate_overlaps)
-from src.shared.tilt import TiltState, apply_tilt, TILT_ORIGIN_Y_FALLBACK
+from src.shared.tilt import (TiltState, apply_tilt, TILT_ORIGIN_Y_FALLBACK,
+                             TILT_MAX_DEG, TILT_MAX_PX)
 from src.shared.jelly import JellyState
+
+# ★ 变换帧（倾斜/Q 弹/镜像）绘制时用的「源图超采样倍数」。
+#   原图 640×360 一次性缩到 288×162（2.2 倍）时，Qt 的双线性只采样 2×2 邻域，
+#   大量源像素被跳过 → 混叠 → 边缘发糊、发脏。这正是"鼠标一靠近就明显变糊"的成因：
+#   角度还没起来，绘制路径已经从「1:1 贴缓存图」切到「重采样」了。
+#   改成先用面积平均缩到 1.5× 显示尺寸，再交给 drawImage 做小倍率缩放+旋转。
+#   ⚠ 中间图**绝不能超过原图尺寸**（见 paintEvent 里的 min(...) 钳制）：
+#     scale=1.0 时显示尺寸就等于原图，1.5× 会变成"放大再缩回"，凭空多两次插值。
+TILT_SRC_SUPERSAMPLE = float(os.environ.get("DSH_PET_TILT_SUPERSAMPLE", "1.5"))
+
+# ★ 预渲染用的重采样器。PIL 的 BICUBIC 支撑域是 4×4（Qt 的 drawImage 只有 2×2
+#   双线性），旋转后高频保留 96.7%，基本和静止持平；代价是 640×360 一次 15ms。
+#   只在「角度档变化」时算一次，之后命中缓存几乎零成本。
+#   PIL 是可选的：没装就自动退回 Qt 双线性（画质 ≈ 71%），不影响运行。
+try:
+    from PIL import Image as _PIL_IMAGE
+except Exception:  # pragma: no cover - 没装 Pillow 时走降级路径
+    _PIL_IMAGE = None
+
+# ★ 倾斜帧「预渲染 + 1:1 贴图」缓存的角量档数（每侧）。
+#   为什么必须这么做：静止时是「像素完美 1:1 贴图」（零重采样），而只要一旋转，
+#   Qt 就必须重采样，画质**无论如何**都比静止时软一点 —— 这就是"鼠标一靠近就变糊"
+#   的根源。把旋转结果预先算好、缓存成 pw×ph 的图，之后每帧只做 1:1 整数贴图，
+#   倾斜时的画质就和静止时完全一致了。
+#   代价是角度被量化（3.5°/24 ≈ 0.15°，边缘位移约 0.75px），倾斜会有一点点阶跃感。
+TILT_CACHE_STEPS = int(os.environ.get("DSH_PET_TILT_STEPS", "24"))
+# 生成缓存图时用的超采样倍数（只付一次，值可以给大）
+# 生成缓存图时的超采样倍数。
+# ★ 关键不是这个数字，而是**顺序**：先在 tw×th 上「只旋转、不缩放」，再用
+#   QImage.scaled(面积平均) 收到 pw×ph。只要让 drawImage 直接把大图缩到小图，
+#   Qt 就退回 2×2 双线性、**跳过源像素** → 混叠 →"开了摇晃整张变糊"。
+#   原理和 GPU 的 mipmap 一样：先把多余像素用面积平均吃掉，再做几何变换。
+TILT_CACHE_SUPERSAMPLE = float(os.environ.get("DSH_PET_TILT_CACHE_SS", "2.0"))
+# 置 0 可关掉预渲染快路径，退回「现场旋转」的旧行为（排查用）
+# ★ 默认关闭（2026-10-30）：预渲染缓存在静态单帧上清晰，但真机连续动画体感更糊
+#   （角度量化跳变 + 双重滤波变软），用户实测否定。代码保留，置 1 可再试。
+TILT_CACHE_ENABLED = os.environ.get("DSH_PET_TILT_CACHE", "1") not in ("0", "false", "no")
 
 ALL_PETS = []
 # 默认模式（新窗口的初值）；实际判定一律看每个实例自己的 self.flock_enabled
@@ -729,6 +768,84 @@ def _alive(obj):
         return True
 
 
+_PET_TIMER_ATTRS = ('phys_timer', '_squash_timer', 'state_timer',
+                    'flock_timer', '_whisper_timer')
+
+
+def _withdraw_inflight(pet):
+    """把窗口从所有"正在解码"的等待队列里摘掉。
+
+    为什么必须摘（2026-10-30 多开崩溃）：
+      `_INFLIGHT[key]` 里存的是 `(self, ...)`，即**强引用着窗口对象**。
+      窗口 deleteLater() 之后 C++ 已经销毁，但 Python 对象被这个引用拖着不死；
+      等解码线程 emit 时 `_first_batch` / `_finish_frames` 还会遍历到它、
+      调 `on_first_batch` → 内部 `self.update()` → 访问已销毁的 QWidget → 0xC0000005。
+    """
+    for key, lst in list(_INFLIGHT.items()):
+        try:
+            lst[:] = [e for e in lst if e[0] is not pet]
+            if not lst:
+                _INFLIGHT.pop(key, None)
+        except Exception:
+            pass
+
+
+def _dispose_pet_qt(pet):
+    """在主线程里**主动**拆掉窗口持有的 QTimer（关闭路径必须调用）。
+
+    为什么必须主动拆 —— 这是"多开偶尔崩溃"的根因：
+      · 这些 QTimer 都 connect 到 `self.xxx` 的 bound method，timer 持有 self、
+        self 持有 timer → **循环引用**，引用计数永远不归零，只能等 GC 收
+      · 窗口 deleteLater() 后被 GC 时，GC 可能在**工作线程**里跑
+        （崩溃日志里那个 `Dummy-78` 线程）
+      · 在非主线程析构 QObject → Qt 打
+        `QObject::~QObject: Timers cannot be stopped from another thread`
+        → 紧跟 0xC0000005 访问违例，进程直接死
+    所以关窗时就把 timer stop + disconnect + 立刻析构，全程在主线程完成；
+    之后 GC 再碰到这些 Python 包装时，C++ 活对象已经不在了。
+    """
+    targets = []
+    for attr in _PET_TIMER_ATTRS:
+        targets.append((pet, attr))
+    bub = getattr(pet, 'bubble', None)
+    if bub is not None:
+        targets.append((bub, 'timer'))
+
+    # ★ 打上"Qt 资源已拆"的标记：关窗后仍可能有一次性的
+    #   QTimer.singleShot(...) 回调打回来（召唤缓冲、DSH 轮询等），
+    #   那些入口一律早退，否则会摸到已经被置 None 的 timer 抛 AttributeError。
+    try:
+        pet._qt_disposed = True
+    except Exception:
+        pass
+
+    for owner, attr in targets:
+        tm = getattr(owner, attr, None)
+        if tm is None:
+            continue
+        try:
+            tm.stop()
+        except Exception:
+            pass
+        try:
+            tm.timeout.disconnect()
+        except Exception:
+            pass
+        try:
+            tm.setParent(None)
+        except Exception:
+            pass
+        try:
+            from shiboken6 import delete as _sb_delete
+            _sb_delete(tm)          # 主线程当场析构 C++ 对象
+        except Exception:
+            pass
+        try:
+            setattr(owner, attr, None)   # 断开 owner → timer 的引用
+        except Exception:
+            pass
+
+
 def _drain_threads(max_ms=5000):
     """退出前等所有解码线程**真正结束**。
 
@@ -895,6 +1012,10 @@ def _first_batch(key, name, images, total):
     if not waiters:
         return
     for pet, anim, cat, msg, gen in waiters:
+        # ★ 窗口可能已经关了（deleteLater 后 C++ 已销毁）：
+        #   此时回调进去会 self.update() → 0xC0000005，必须跳过。
+        if not _alive(pet):
+            continue
         if getattr(pet, '_load_gen', 0) != gen:
             continue
         try:
@@ -906,6 +1027,8 @@ def _first_batch(key, name, images, total):
 def _finish_frames(key, name, qimages):
     waiters = _INFLIGHT.pop(key, [])
     for pet, anim, cat, msg, gen in waiters:
+        if not _alive(pet):
+            continue
         if getattr(pet, '_load_gen', 0) != gen:
             continue
         try:
@@ -1421,6 +1544,24 @@ class PetWindow(QWidget):
         _static = (not _tilt_on and not _jelly_on
                    and squash == 1.0 and not mirror)
 
+        # ★★ 纯倾斜帧（没有 Q 弹、没有 squash）：走「预渲染角度缓存 + 1:1 整数贴图」。
+        #   这是让倾斜画质**追平静止**的唯一办法 —— 任何现场旋转都要重采样，
+        #   而 1:1 贴图是零重采样。缓存图按角度档预先生成（用 2× 超采样保证质量），
+        #   之后每帧只付一次 drawImage 整数坐标贴图。
+        #   淡化期间（动作切换那 0.18s）不走这条，免得漏掉垫底旧帧。
+        _only_tilt = (TILT_CACHE_ENABLED and _tilt_on and not _jelly_on
+                      and squash == 1.0)
+        if _only_tilt and self._fade_from is None:
+            try:
+                _q = round(self.tilt.cur * TILT_CACHE_STEPS) / float(TILT_CACHE_STEPS)
+                _cimg = self._tilt_rendered(_q, mirror, pw, ph)
+            except Exception:
+                _cimg = None
+            if _cimg is not None and not _cimg.isNull():
+                _dx = int(round(self.tilt.offset_x))
+                painter.drawImage(int(x) + _dx, int(y), _cimg)
+                return
+
         painter.save()
         if mirror:
             cx = x + pw / 2.0
@@ -1499,10 +1640,149 @@ class PetWindow(QWidget):
             else:
                 painter.drawImage(dst_rect, self.cur_pix, src_rect)
         else:
-            # 有变换路径：用原图 + 复合变换，保证高清（一次重采样）
-            painter.drawImage(dst_rect, self.cur_pix, src_rect)
+            # 有变换路径。**只有带旋转**（倾斜 / 拖拽拉伸）时才值得用超采样源图：
+            # 旋转会把每个输出像素摊到 4 个源像素上，此时缩小倍率大就容易混叠。
+            # 纯镜像 / 纯缩放（settle、pop、squash）不旋转，用原图即可 ——
+            # 群体模式里满屏都是镜像的移动帧，给它们也生成中间图会把 CPU 拖垮。
+            _need_hi = _tilt_on or (_jelly_on and _jdrag)
+            _ssrc = None
+            if _need_hi:
+                # 先用**面积平均**缩到 1.5× 显示尺寸，再交给 drawImage 做
+                # 「缩 0.67 倍 + 旋转」这一次重采样。原因见 TILT_SRC_SUPERSAMPLE。
+                # ★ 中间图绝不能超过原图尺寸：scale=1.0 时 pw 就等于原图宽，
+                #   1.5× 会变成「放大再缩回」，凭空多两次插值、只剩损失
+                #   （实测高频 10.19% → 6.25%，反而比不超采样还低）。
+                try:
+                    _tw = min(max(1, int(round(pw * TILT_SRC_SUPERSAMPLE))),
+                              self.cur_pix.width())
+                    _th = min(max(1, int(round(ph * TILT_SRC_SUPERSAMPLE))),
+                              self.cur_pix.height())
+                    _ssrc = self._scaled_frame_for_paint(_tw, _th)
+                except Exception:
+                    _ssrc = None
+            if _ssrc is not None and not _ssrc.isNull():
+                painter.drawImage(dst_rect, _ssrc,
+                                  QRectF(0.0, 0.0, float(_ssrc.width()), float(_ssrc.height())))
+            else:
+                painter.drawImage(dst_rect, self.cur_pix, src_rect)
         painter.setOpacity(1.0)
         painter.restore()
+
+    def _tilt_rendered(self, quant, mirror_on, pw, ph):
+        """按角度档预渲染一张「已旋转好」的 pw×ph 图（**不含**横向位移）。
+
+        quant 是量化到 1/TILT_CACHE_STEPS 的 cur 值（-1~1），横向位移由调用方
+        用整数坐标叠加，这样缓存只按角度分档，不必为每个位移量再存一份。
+
+        生成时先用 TILT_CACHE_SUPERSAMPLE 倍的**面积平均**图（默认 1.0，即和静止
+        用的是同一张 288×162），painter 只做**旋转**、不做缩放 —— 一旦让 drawImage
+        去缩小，Qt 就退回 2×2 双线性、跳过源像素，整张图会糊。
+        之后每帧只是 1:1 整数贴图，零重采样。
+        """
+        # 角度归零且不镜像：直接用静止那张，保证和「没摇晃」时**像素级一致**
+        if not quant and not mirror_on:
+            still = self._scaled_frame_for_paint(pw, ph)
+            if still is not None and not still.isNull():
+                return still
+        key = (id(self.cur_pix), quant, bool(mirror_on), pw, ph)
+        from PySide6.QtGui import QImage, QPainter
+        c = getattr(self, '_tilt_paint_cache', None)
+        if c is None:
+            c = {}
+            self._tilt_paint_cache = c
+        hit = c.get(key)
+        if hit is not None:
+            return hit
+        # 只保留当前帧的条目（帧一换，旧的全部作废）。
+        # 不设阈值直接清：一帧最多 TILT_CACHE_STEPS×2 张，内存可控。
+        cur_id = id(self.cur_pix)
+        if any(k[0] != cur_id for k in c):
+            for k in [k for k in c if k[0] != cur_id]:
+                c.pop(k, None)
+        # ★ 优先用 PIL 的 BICUBIC（支撑域 4×4，高频保留 ≈ 97%）；
+        #   Qt 的 drawImage 只有 2×2 双线性，旋转一次就掉到 ≈ 71%。
+        #   实测 640×360 一次 bicubic 旋转 15ms，只在换角度档时发生。
+        if _PIL_IMAGE is not None:
+            got = self._tilt_rendered_pil(quant, mirror_on, pw, ph)
+            if got is not None:
+                c[key] = got
+                return got
+        tw = min(max(1, int(round(pw * TILT_CACHE_SUPERSAMPLE))), self.cur_pix.width())
+        th = min(max(1, int(round(ph * TILT_CACHE_SUPERSAMPLE))), self.cur_pix.height())
+        ssrc = self._scaled_frame_for_paint(tw, th)
+        if ssrc is None or ssrc.isNull():
+            return None
+        # ★ 画布也是 tw×th：让 painter 在该尺寸上**只旋转、不缩放**（1:1），
+        #   最后再用 QImage.scaled(面积平均) 缩到 pw×ph。
+        #   顺序很关键 —— 一旦让 drawImage 直接缩到 pw×ph，Qt 就用 2×2 双线性
+        #   跳过源像素，混叠会原样回来（这正是"开了摇晃就糊"的根源）。
+        try:
+            canvas = QImage(tw, th, QImage.Format_ARGB32_Premultiplied)
+        except Exception:
+            return None
+        canvas.fill(Qt.transparent)
+        p = QPainter(canvas)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        if mirror_on:
+            p.translate(float(tw), 0.0)
+            p.scale(-1.0, 1.0)
+        pivot_y = self._tilt_pivot_y() * (float(th) / float(ph))
+        p.translate(tw / 2.0, pivot_y)
+        p.rotate(float(quant) * TILT_MAX_DEG)
+        p.translate(-tw / 2.0, -pivot_y)
+        p.drawImage(QRectF(0.0, 0.0, float(tw), float(th)), ssrc,
+                    QRectF(0.0, 0.0, float(ssrc.width()), float(ssrc.height())))
+        p.end()
+        if (tw, th) != (pw, ph):
+            # 面积平均收尾（这是 Qt 里唯一「每个源像素都参与」的缩小路径）
+            canvas = canvas.scaled(pw, ph, Qt.IgnoreAspectRatio,
+                                   Qt.SmoothTransformation)
+        c[key] = canvas
+        return canvas
+
+    def _tilt_rendered_pil(self, quant, mirror_on, pw, ph):
+        """用 PIL 的 BICUBIC 按角度档预渲染（高频保留 ≈ 静止的 96.7%）。
+
+        为什么值得：Qt 的 drawImage 只有 2×2 双线性，3.5° 旋转后高频从
+        10.19% 掉到 7.27%（只剩 71%）；BICUBIC 支撑域 4×4，能到 9.85%（96.7%），
+        肉眼基本看不出和「不摇晃」的差别。
+
+        坐标约定（踩过的坑）：PIL 的 AFFINE 把输出像素 (x, y) 映射到输入
+        (a*x+b*y+c, ...)，其中 (0, 0) **就是第一个像素的中心** —— 实测 offset=0
+        时恒等变换与 NEAREST 逐像素完全一致，offset=±0.5 则整体偏移半像素。
+        所以这里不要额外加 0.5。
+        """
+        if _PIL_IMAGE is None:
+            return None
+        from PySide6.QtGui import QImage
+        src = self.cur_pix
+        if src is None or src.isNull():
+            return None
+        sw, sh = src.width(), src.height()
+        if sw <= 0 or sh <= 0 or pw <= 0 or ph <= 0:
+            return None
+        try:
+            q = src.convertToFormat(QImage.Format_RGBA8888)
+            im = _PIL_IMAGE.frombytes("RGBA", (sw, sh), bytes(q.constBits()))
+            if mirror_on:
+                im = im.transpose(_PIL_IMAGE.FLIP_LEFT_RIGHT)
+            kx = sw / float(pw)          # 输出 → 源的缩放比
+            ky = sh / float(ph)
+            ang = math.radians(float(quant) * TILT_MAX_DEG)
+            ca, sa = math.cos(ang), math.sin(ang)
+            pxc = pw / 2.0
+            pyc = ph * TILT_ORIGIN_Y_FALLBACK
+            c0 = kx * (ca * (-pxc) + sa * (-pyc) + pxc)
+            f0 = ky * (-sa * (-pxc) + ca * (-pyc) + pyc)
+            out = im.transform((pw, ph), _PIL_IMAGE.AFFINE,
+                               (kx * ca, kx * sa, c0, -ky * sa, ky * ca, f0),
+                               resample=_PIL_IMAGE.BICUBIC)
+            qi = QImage(out.tobytes(), pw, ph, pw * 4, QImage.Format_RGBA8888)
+            return qi.convertToFormat(
+                QImage.Format_ARGB32_Premultiplied).copy()
+        except Exception:
+            return None
 
     def _scaled_frame_for_paint(self, pw, ph):
         """给「无变换」帧用的已缩放图缓存（按当前帧 + 目标尺寸）。
@@ -1522,9 +1802,15 @@ class PetWindow(QWidget):
             hit = c.get(key)
             if hit is not None:
                 return hit
-            # 只留最近 2 个（当前帧 + 上一帧），避免内存膨胀
-            if len(c) > 2:
-                c.clear()
+            # ★ 按**尺寸分组**各留 2 张（当前帧 + 上一帧），不是按总条数。
+            #   倾斜时会在「288 显示图」和「432 变换源图」两个尺寸之间来回请求，
+            #   用总条数限制会让两组互相清空 → 帧帧重算。
+            #   按尺寸分组则两组各自稳定，内存也不会随条数膨胀
+            #   （群体 100 只只用得到 288 那一组，约 0.37MB/只）。
+            same = [k for k in c if k[1] == pw and k[2] == ph]
+            if len(same) > 2:
+                for k in same[:len(same) - 2]:
+                    c.pop(k, None)
             scaled = self.cur_pix.scaled(pw, ph,
                                          Qt.IgnoreAspectRatio,
                                          Qt.SmoothTransformation)
@@ -1542,6 +1828,9 @@ class PetWindow(QWidget):
         return (bx - pad) <= pos.x() <= (bx + bw + pad) and (by - pad) <= pos.y() <= (by + bh + pad)
 
     def load_next_action(self, force=False):
+        # ★ 已关窗（Qt 资源拆完）：一次性回调可能还会打回来，直接早退
+        if getattr(self, '_qt_disposed', False):
+            return
         # ★ 拖拽与飞行期间不换动作：拖拽最高优先级，飞行中也不该被随机动作打断。
         if self.drag_on or self.phys_timer.isActive():
             return
@@ -2617,6 +2906,11 @@ class PetWindow(QWidget):
                 self._ws_turn_t0 = 0.0
 
     def closeEvent(self, event):
+        # ★ 先在主线程拆掉 QTimer 与解码等待队列，再收线程、关窗口：
+        #   否则这些 QObject 要等 GC 回收，而 GC 可能跑在工作线程里 →
+        #   "Timers cannot be stopped from another thread" + 0xC0000005。
+        _withdraw_inflight(self)
+        _dispose_pet_qt(self)
         for ld in list(self.loaders):
             try:
                 if ld.isRunning():
@@ -2826,6 +3120,8 @@ class PetWindow(QWidget):
 
     def _poll_dsh_gone(self):
         """轮询 DSH 是否已完全退出；退出后清理残留锁。"""
+        if getattr(self, '_qt_disposed', False):
+            return
         try:
             self._wait_dsh_gone_tries = getattr(self, '_wait_dsh_gone_tries', 0) + 1
             if is_dsh_running():
@@ -2978,6 +3274,8 @@ class PetWindow(QWidget):
         """启动后 3 秒的存活校验。进程已退出则清锁重试一次，仍失败才报错。"""
         import subprocess
 
+        if getattr(self, '_qt_disposed', False):
+            return
         try:
             rc = proc.poll()
         except Exception as e:
@@ -3019,6 +3317,8 @@ class PetWindow(QWidget):
 
     def _verify_retry(self, proc):
         """重试后的校验（不再递归重试，避免死循环）。"""
+        if getattr(self, '_qt_disposed', False):
+            return
         try:
             rc = proc.poll()
         except Exception:
@@ -3114,6 +3414,8 @@ class PetWindow(QWidget):
         2500ms TTL 还过期了 → 观感是"2 秒到了却一直发呆"，四散奔逃消失。
         现在 force=True 直接打断，并当场写入 roam 意图，保证 2 秒整全体一起跑。
         """
+        if getattr(self, '_qt_disposed', False):
+            return          # 缓冲期内被关掉了，别再摸已拆掉的 Qt 资源
         try:
             self._spawn_hold_until = 0.0
             self._pending_next = False
@@ -3693,6 +3995,9 @@ class PetWindow(QWidget):
                 return QApplication.quit()
         except Exception:
             pass
+        # ★ 主线程先拆 QTimer + 摘解码队列（见 _dispose_pet_qt 的说明）
+        _withdraw_inflight(self)
+        _dispose_pet_qt(self)
         try:
             self.bubble.close()
         except Exception:
@@ -3743,7 +4048,17 @@ class PetWindow(QWidget):
                 pass
 
         # 2) 中断线程：不等待，引用交给全局回收表
+        #    ★ 同时摘掉解码等待队列 + 在主线程拆掉 QTimer：
+        #      不摘的话 `_INFLIGHT` 会一直强引用这些窗口，线程 emit 时回调到
+        #      已 deleteLater 的 QWidget（0xC0000005）；
+        #      不拆 timer 的话它们要等 GC，而 GC 可能跑在工作线程里 →
+        #      "Timers cannot be stopped from another thread" 然后崩溃。
         for pp in targets:
+            try:
+                _withdraw_inflight(pp)
+                _dispose_pet_qt(pp)
+            except Exception:
+                pass
             try:
                 for ld in list(getattr(pp, 'loaders', [])):
                     try:
