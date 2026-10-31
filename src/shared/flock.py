@@ -224,6 +224,7 @@ def pick_roam_tier(overlap, p=None):
 # ---------------------------------------------------------------------------
 
 COLLIDE_EPS = 1e-6
+CONTACT_SOFT_PX = 6.0   # 贴边量级的浅重叠：允许朝"拉开"的方向走，不判成挡路
 
 
 def aabb_contact(ax, ay, ahw, ahh, bx, by, bhw, bhh, ux, uy):
@@ -252,147 +253,72 @@ def aabb_contact(ax, ay, ahw, ahh, bx, by, bhw, bhh, ux, uy):
     #   若判成"接触"会把身后的邻居当成挡路者（链式推会原地空转）。
     if t_exit <= 0:
         return None            # b 整个在身后（或刚好贴边且已错开）
-    return max(0.0, t_enter)
+    if t_enter <= 0:
+        # 起点已经在扩张盒里 = 起手就重叠（或正好贴边）。
+        # 这时**不能一律判成 0**：分离兜底每次只挪几个像素，会长期停在
+        # "重叠零点几像素"的状态；若连朝反方向（拉开距离）都返回 0，
+        # 那只就彻底卡死、再也走不开（用户 2026-10-31 报的现象）。
+        #
+        # 但也不能一律放行：完全重合时（多开召唤叠在屏幕正中）两只该交给
+        # separate_overlaps 分开，放行会互相穿透。
+        # 所以按穿透深度分级：
+        #   · 浅重叠（≤ CONTACT_SOFT_PX，贴边量级）→ 看方向：在拉开就放行；
+        #   · 深重叠 → 返回 0，交给分离兜底。
+        _ox0 = (ahw + bhw) - abs(ax - bx)
+        _oy0 = (ahh + bhh) - abs(ay - by)
+        if min(_ox0, _oy0) > CONTACT_SOFT_PX:
+            return 0.0         # 真的叠在一起 → 交给分离兜底
+        # 沿 u 走 1px，只要没有任何一轴变得更深，就是在拉开（或平行滑开）
+        _eps = 1.0
+        _ox1 = (ahw + bhw) - abs(ax + ux * _eps - bx)
+        _oy1 = (ahh + bhh) - abs(ay + uy * _eps - by)
+        if _ox1 > _ox0 + 1e-9 or _oy1 > _oy0 + 1e-9:
+            return 0.0         # 越走越深 → 确实被挡
+        return None            # 没有变深 → 正在拉开，放行
+    return t_enter
 
 
-def overlap_depth(ax, ay, ahw, ahh, bx, by, bhw, bhh):
-    """两个轴对齐框的穿透深度 (dx, dy)：都 >0 表示重叠，取小的那个轴作为脱离方向。"""
-    ox = (ahw + bhw) - abs(ax - bx)
-    oy = (ahh + bhh) - abs(ay - by)
-    return ox, oy
+def blocked_travel(mover, mates, ux, uy, want, clamp_fn):
+    """mover 沿单位方向 (ux, uy) 最多走 want；前方有人就停在贴脸处，**不推人**。
 
-
-def resolve_push(mover, mates, dx, dy, clamp_fn):
-    """单体模式推箱子碰撞：mover 想走 (dx, dy)，沿途把挡路的顶开。
+    单体模式的漫游位移用它：撞不过去就停在原地把动画播完，而不是把别人顶走。
 
     参数
-      mover   = (cx, cy, half_w, half_h)  身体中心 + 半尺寸
-      mates   = [(key, cx, cy, half_w, half_h), ...]  其他单体鱼
-      clamp_fn(key, cx, cy) -> (cx, cy)
-                把某只的中心夹进它允许的范围（屏幕边缘）。
-                key 为 None 表示 mover 自己。
-    返回
-      (new_cx, new_cy, pushes)
-        pushes = [(key, new_cx, new_cy), ...]  **被顶开**的每一只的最终中心
-                （没动过的不会出现在这里，调用方可以据此跳过 setGeometry）
+      mover    = (cx, cy, half_w, half_h)
+      mates    = [(key, cx, cy, half_w, half_h), ...]
+      ux, uy   = 单位方向（调用方保证已归一化）
+      want     = 本次想走的距离（>= 0）
+      clamp_fn = clamp_fn(key, cx, cy) -> (cx, cy)，key 传 None 表示 mover 自己
 
-    设计要点（推箱子语义）
-      · 撞人者前进，被撞者被顶开同样的量，链式一路传下去；
-      · 任何一环被屏幕边缘卡住 → 整条链一起停，撞人者也不前进；
-      · **起手就已经重叠时**（比如刚召唤完叠在屏幕正中）先按穿透深度把
-        挡路者沿推进方向推开，把它"吐"出去，而不是两只贴着一起漂移。
+    返回 (allowed, hit_key, hit_t)
+      allowed = 实际能走的距离（0 ≤ allowed ≤ want）
+      hit_key = 挡住它的那一只（没挡住则 None）
+      hit_t   = 与那一只的首次接触距离（没挡住则 None）
 
-    注意：这是纯数学，不依赖 Qt；每帧调用一次，复杂度 O(N²)，N=10 时约百次判定。
+    ★ 起手就重叠时返回 0：交给 `separate_overlaps` 每帧分离一点，
+      而不是在这里硬挤 —— 否则两只贴在一起会互相穿透着漂移。
     """
-    dist = math.hypot(dx, dy)
-    if dist < COLLIDE_EPS:
-        return mover[0], mover[1], []
-    ux, uy = dx / dist, dy / dist
+    if want <= COLLIDE_EPS:
+        return 0.0, None, None
+    cx, cy, hw, hh = mover
 
-    state = {None: [float(mover[0]), float(mover[1]), float(mover[2]), float(mover[3])]}
-    for key, cx, cy, hw, hh in mates:
-        state[key] = [float(cx), float(cy), float(hw), float(hh)]
+    # ① 屏幕边缘：先夹紧，取沿 u 的可行距离
+    tx, ty = clamp_fn(None, cx + ux * want, cy + uy * want)
+    wall = (tx - cx) * ux + (ty - cy) * uy
+    limit = max(0.0, min(want, wall))
 
-    moved = set()      # 被顶开的 key
-    visiting = set()   # 防环
+    # ② 最近的挡路者（取进入距离最小的那只）
+    hit_key = None
+    hit_t = math.inf
+    for key, mx, my, mhw, mhh in mates:
+        t = aabb_contact(cx, cy, hw, hh, mx, my, mhw, mhh, ux, uy)
+        if t is not None and t < hit_t:
+            hit_t = t
+            hit_key = key
 
-    def _advance(key, amount, depth=0):
-        """让 key 沿 u 前进至多 amount，返回实际前进距离。
-
-        语义 = 推箱子：
-          · 没挡路 → 走满；
-          · 撞上 → 先走到贴脸处，再把挡路者顶开，**自己跟着它前进的量走**；
-          · 挡路者顶不动（贴墙/链尾卡死）→ 自己也就停在贴脸处。
-        """
-        if amount <= COLLIDE_EPS or depth > len(state) + 1:
-            return 0.0
-        cx, cy, hw, hh = state[key]
-
-        # ① 屏幕边缘：先夹紧，取沿 u 的可行距离
-        tx, ty = clamp_fn(key, cx + ux * amount, cy + uy * amount)
-        wall = (tx - cx) * ux + (ty - cy) * uy
-        limit = min(amount, max(0.0, wall))
-        if limit <= COLLIDE_EPS:
-            return 0.0
-
-        # ② 找最近的挡路者（取进入距离最小的那只）
-        hit_key = None
-        hit_t = math.inf
-        for other, st in state.items():
-            if other == key or other in visiting:
-                continue
-            t = aabb_contact(cx, cy, hw, hh, st[0], st[1], st[2], st[3], ux, uy)
-            if t is not None and t < hit_t:
-                hit_t = t
-                hit_key = other
-
-        # ③ 畅通：直接走
-        if hit_key is None or hit_t >= limit:
-            state[key][0] = cx + ux * limit
-            state[key][1] = cy + uy * limit
-            if key is not None:
-                moved.add(key)
-            return limit
-
-        # ④ 先走到贴脸处
-        state[key][0] = cx + ux * hit_t
-        state[key][1] = cy + uy * hit_t
-        if key is not None and hit_t > COLLIDE_EPS:
-            moved.add(key)
-
-        rest = limit - hit_t
-        if rest <= COLLIDE_EPS:
-            return hit_t
-
-        # ⑤ 起手就重叠 → 先把被撞者沿 u 吐出去（不算撞人者的行程）
-        _unstick(key, hit_key, ux, uy)
-
-        # ⑥ 顶它。它让开多少，自己就跟着走多少。
-        visiting.add(hit_key)
-        pushed = _advance(hit_key, rest, depth + 1)
-        visiting.discard(hit_key)
-
-        state[key][0] += ux * pushed
-        state[key][1] += uy * pushed
-        if key is not None and pushed > COLLIDE_EPS:
-            moved.add(key)
-        return hit_t + pushed
-
-    def _unstick(a_key, b_key, ux, uy):
-        """a 与 b 已重叠时，沿 u 把 b 顶出重叠区，返回顶出的距离。
-
-        ★ 必须沿 **u 本身** 退到不重叠，而不是按最短脱离轴：
-          按最短轴会把 b 往侧面弹，与"被推着沿同一方向移动"不符。
-          做法是把 b 沿 u 二分/解析推进到「不再重叠」的最小距离。
-        """
-        a = state[a_key]
-        b = state[b_key]
-        if overlap_depth(a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3])[0] <= COLLIDE_EPS:
-            return 0.0
-        ox, oy = overlap_depth(a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3])
-        if oy <= COLLIDE_EPS:
-            return 0.0
-        # 沿 u 退出所需的距离：两个轴分别算出"还要退多少才分开"
-        need = 0.0
-        if abs(ux) > COLLIDE_EPS:
-            need = max(need, ox / abs(ux))
-        if abs(uy) > COLLIDE_EPS:
-            need = max(need, oy / abs(uy))
-        if need <= COLLIDE_EPS:
-            return 0.0
-        # b 沿 u 后退可能被墙卡住 → 取实际可行量
-        tx, ty = clamp_fn(b_key, b[0] + ux * need, b[1] + uy * need)
-        got = (tx - b[0]) * ux + (ty - b[1]) * uy
-        if got <= COLLIDE_EPS:
-            return 0.0
-        b[0] += ux * got
-        b[1] += uy * got
-        moved.add(b_key)
-        return got
-
-    _advance(None, dist)
-    pushes = [(k, state[k][0], state[k][1]) for k in moved if k is not None]
-    return state[None][0], state[None][1], pushes
+    if hit_key is None or hit_t >= limit:
+        return limit, None, None
+    return max(0.0, hit_t), hit_key, hit_t
 
 
 SEPARATE_MAX_STEP = 8.0   # 单次分离最多挪这么多 px（防瞬移观感）
@@ -401,13 +327,9 @@ SEPARATE_MAX_STEP = 8.0   # 单次分离最多挪这么多 px（防瞬移观感�
 def separate_overlaps(entries, clamp_fn, iterations=3, max_step=SEPARATE_MAX_STEP):
     """残留重叠的全局分离（兜底）。
 
-    为什么需要它：每只宠物各自调 resolve_push 时，看到的是**上一帧**的邻居位置。
-    两只相向而行时，各自都以为对方没动，结算完就会留下重叠。
-    这里在一帧的所有移动都落定后统一跑一遍，把残余重叠推开。
-
-    与 resolve_push 的分工：
-      · resolve_push = 主动推进时的"推着走"（撞者前进、被撞者被顶，链式）；
-      · separate_overlaps = 事后兜底，只处理"已经叠上了"的残余。
+    为什么需要它：漫游只在"已经贴住"时停步，但**起手就叠在一起**的情形
+    （多开召唤时全体叠在屏幕正中）谁都不许动 —— 那时靠这里每帧把重叠
+    推开一点，几次迭代后各自散开，随后才谈得上漫游。
 
     沿**穿透最浅的轴**各退一半（一方贴墙时另一方退全部），
     单次最多挪 max_step px，多迭代几次逼近。

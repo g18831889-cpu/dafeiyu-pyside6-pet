@@ -85,20 +85,34 @@ check("半尺寸按 scale 换算",
       abs(hw - BODY_BOX[2] * s / 2.0) < 1e-6 and abs(hh - BODY_BOX[3] * s / 2.0) < 1e-6,
       f"({hw:.2f},{hh:.2f})")
 
-print("\n=== 4. 撞到人 → 对方被顶开 ===")
+print("\n=== 4. 前方有人 → 自己停在贴脸处，对方不动 ===")
 body_w = BODY_BOX[2] * s
 # ★ offscreen 的虚拟屏只有 800×800，位置必须落在屏内，
 #   否则会被 clamp_body_center 夹到边缘、推不动（那是环境限制，不是 bug）。
 s1.apply_body_center(200.0, 400.0)
-s2.apply_body_center(200.0 + body_w, 400.0)
+s2.apply_body_center(200.0 + body_w + 60.0, 400.0)   # 前方 60px 处有人
 before2 = s2.body_aabb()[0]
 cxa, cya, hwa, hha = s1.body_aabb()
 nx, ny = s1._resolve_move_with_collision(cxa, cya, cxa + 120.0, cya)
 after2 = s2.body_aabb()[0]
-check("撞人者能前进一些", nx > cxa + 1.0, f"dx={nx - cxa:.1f}")
-check("被撞者被顶开", after2 > before2 + 1.0, f"dx={after2 - before2:.1f}")
+check("撞人者只走到贴脸处", abs((nx - cxa) - 60.0) < 1.5, f"dx={nx - cxa:.1f}（应约 60）")
+check("对方一动不动", abs(after2 - before2) < 1e-6, f"dx={after2 - before2:.2f}")
 gap = s2.body_aabb()[0] - s1.body_aabb()[0]
-check("碰后不重叠", gap >= body_w - 1.5, f"gap={gap:.1f} / need={body_w:.1f}")
+check("停住后恰好贴边不重叠", gap >= body_w - 1.5, f"gap={gap:.1f} / need={body_w:.1f}")
+
+print("\n=== 4b. 已经贴住 → 一步都不走（原地跑） ===")
+s1.apply_body_center(200.0, 400.0)
+s2.apply_body_center(200.0 + body_w, 400.0)          # 正好贴脸
+cxa, cya, _, _ = s1.body_aabb()
+nx, ny = s1._resolve_move_with_collision(cxa, cya, cxa + 120.0, cya)
+check("贴住后走不动", abs(nx - cxa) < 0.5, f"dx={nx - cxa:.2f}")
+
+print("\n=== 4c. 前方没人 → 走满全程 ===")
+s2.apply_body_center(200.0 + body_w + 500.0, 400.0)
+s1.apply_body_center(200.0, 400.0)
+cxa, cya, _, _ = s1.body_aabb()
+nx, ny = s1._resolve_move_with_collision(cxa, cya, cxa + 120.0, cya)
+check("畅通时走满 120", abs((nx - cxa) - 120.0) < 1e-6, f"dx={nx - cxa:.1f}")
 
 print("\n=== 5. 全局兜底分离 ===")
 s1.apply_body_center(200.0, 400.0)

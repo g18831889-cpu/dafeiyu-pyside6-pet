@@ -17,7 +17,7 @@ from src.shared.pickers import pick_big_pool_equal, pick_category_action
 from src.shared.physics import (update_physics, landing_squash, squash_scale,
                                 SQ_DURATION_MS, SQ_SQUASH)
 from src.shared.flock import (steer_target, speed_up_for, roam_chance_for_overlap,
-                              overlap_ratio, resolve_push, separate_overlaps)
+                              overlap_ratio, blocked_travel, separate_overlaps)
 from src.shared.tilt import (TiltState, apply_tilt, TILT_ORIGIN_Y_FALLBACK,
                              TILT_MAX_DEG, TILT_MAX_PX)
 from src.shared.jelly import JellyState
@@ -2276,20 +2276,6 @@ class PetWindow(QWidget):
                 self.move_target_y = self.move_start_y
                 # 与位移方向再对齐一次（dist 可能被边界裁剪）
                 self._apply_facing((self.move_target_x - self.move_start_x) >= 0)
-                # ★ 单体模式硬碰撞：目标点先过一遍推箱子，算出真正能到的位置。
-                #   这一步只改"目标点"，不改动画；被撞者在这时就被顶开了。
-                if self.collide_participates():
-                    try:
-                        cx0, cy0, _, _ = self.body_aabb()
-                        s_ = self.scale
-                        bx_, by_, bw_, bh_ = BODY_BOX
-                        tx_ = self.move_target_x + (bx_ + bw_ / 2.0) * s_
-                        ty_ = self.move_target_y + (by_ + bh_ / 2.0) * s_
-                        ncx, ncy = self._resolve_move_with_collision(cx0, cy0, tx_, ty_)
-                        self.move_target_x = ncx - (bx_ + bw_ / 2.0) * s_
-                        self.move_target_y = ncy - (by_ + bh_ / 2.0) * s_
-                    except Exception:
-                        pass
 
     def advance(self, elapsed_ms):
         """照搬大肥鱼的 animation_model.advance。
@@ -2516,19 +2502,29 @@ class PetWindow(QWidget):
                 max_y = scr.bottom() + BOTTOM_EXTEND - TOP_SHIFT + allow_y - _by * _s - body_h
                 cx2 = max(int(min_x), min(int(cur_x), int(max_x)))
                 cy2 = max(int(min_y), min(int(cur_y), int(max_y)))
-                # ★ 单体模式硬碰撞：逐帧夹紧，保证插值中途也不会穿过别人。
-                #   被撞者同样被顶着走（只改位置，动画照旧）。
+                # ★ 单体模式硬碰撞：逐帧夹紧。前方贴住了就**停止移动行为**，
+                #   动画照常播完（用户 2026-10-31 口径：别人的碰撞框不可撼动）。
                 if self.collide_participates():
                     try:
                         _s2 = self.scale
                         _bx2, _by2, _bw2, _bh2 = BODY_BOX
                         cxa, cya, _, _ = self.body_aabb()
+                        # ★ 先判"这一帧本来要不要动"：漫游的起步段与收尾段
+                        #   roam_ratio 恒为 0/1，位置本该冻结 —— 那时"没动"
+                        #   是正常的，**不是被挡住**。漏了这一步会让每一段
+                        #   漫游的第一帧就误判成"贴住"，整段原地跑。
+                        _want_move = (cx2 != self.x()) or (cy2 != self.y())
                         ncx2, ncy2 = self._resolve_move_with_collision(
                             cxa, cya,
                             cx2 + (_bx2 + _bw2 / 2.0) * _s2,
                             cy2 + (_by2 + _bh2 / 2.0) * _s2)
-                        cx2 = int(round(ncx2 - (_bx2 + _bw2 / 2.0) * _s2))
-                        cy2 = int(round(ncy2 - (_by2 + _bh2 / 2.0) * _s2))
+                        if (_want_move
+                                and abs(ncx2 - cxa) < 1e-6
+                                and abs(ncy2 - cya) < 1e-6):
+                            self.is_moving_action = False   # 贴住了 → 停步，动画继续
+                        else:
+                            cx2 = int(round(ncx2 - (_bx2 + _bw2 / 2.0) * _s2))
+                            cy2 = int(round(ncy2 - (_by2 + _bh2 / 2.0) * _s2))
                     except Exception:
                         pass
                 self.move(cx2, cy2)
@@ -3670,36 +3666,37 @@ class PetWindow(QWidget):
         return out
 
     def _resolve_move_with_collision(self, from_cx, from_cy, to_cx, to_cy):
-        """单体模式：把"想走到的位置"过一遍推箱子碰撞，返回实际落点。
+        """单体模式：把"想走到的位置"裁到"贴住为止"，**不推别人**。
 
-        撞人者按原速前进，被撞者被顶着同速后退；链式一路传；
-        任何一环被屏幕边缘卡住 → 整条链一起停。
+        用户 2026-10-31 改的口径：前方有别的单体鱼就当它是障碍物 ——
+        自己走到贴脸处停下，剩下的动画原地播完；对方一动不动。
+
+        返回 (new_cx, new_cy)。被挡时 new 落在接触点上，不会穿过对方。
         """
         mates = self._collide_mates()
         if not mates:
             return to_cx, to_cy
-        hw = self.body_aabb()[2]
-        hh = self.body_aabb()[3]
+        dx, dy = to_cx - from_cx, to_cy - from_cy
+        dist = math.hypot(dx, dy)
+        if dist < 1e-6:
+            return to_cx, to_cy
+        ux, uy = dx / dist, dy / dist
+        _, _, hw, hh = self.body_aabb()
 
         def _clamp(key, cx, cy):
-            if key is None:
-                return self.clamp_body_center(cx, cy)
-            return key.clamp_body_center(cx, cy)
+            # blocked_travel 只会用 key=None 询问 mover 自己
+            return self.clamp_body_center(cx, cy)
 
         try:
-            nx, ny, pushes = resolve_push(
+            allowed, hit_key, _hit_t = blocked_travel(
                 (from_cx, from_cy, hw, hh),
                 [(pp, cx, cy, phw, phh) for pp, cx, cy, phw, phh in mates],
-                to_cx - from_cx, to_cy - from_cy, _clamp)
+                ux, uy, dist, _clamp)
         except Exception:
             return to_cx, to_cy
-        # 被顶开的那几只：只改位置，动画照旧
-        for pp, px, py in pushes:
-            try:
-                pp.apply_body_center(px, py)
-            except Exception:
-                pass
-        return nx, ny
+        if hit_key is None and allowed >= dist - 1e-6:
+            return to_cx, to_cy
+        return from_cx + ux * allowed, from_cy + uy * allowed
 
     def _apply_facing(self, right):
         prev = getattr(self, '_facing_right', None)
