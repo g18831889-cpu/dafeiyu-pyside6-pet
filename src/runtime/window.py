@@ -1711,6 +1711,13 @@ class PetWindow(QWidget):
         self._whisper_timer.setSingleShot(True)
         self._whisper_timer.timeout.connect(self._fire_whisper)
         self.schedule_whisper()
+        # ---- 记忆外挂（可选功能）：启动时把磁盘上的开关状态同步进 store ----
+        # 外挂目录不存在 → 异常 → 静默跳过，桌宠行为与没有本功能时完全一致。
+        try:
+            mt = self._load_memory_toggle()
+            mt.sync_to_store(self.store)
+        except Exception:
+            pass
         
         self.load_next_action()
 
@@ -3094,6 +3101,15 @@ class PetWindow(QWidget):
     def poll_state(self):
         if not self.store: return
         if getattr(self, 'spawn_idx', 0) != 0: return
+        # ---- 记忆外挂（可选功能）：整块包 try/except ----
+        # 记忆外挂目录删掉、store 没有这些方法、灵魂没在跑 —— 都只会走 except，
+        # 下面的原生逻辑一个字节都不受影响。
+        # 返回 True = 记忆模式已接管，跳过原生工作状态映射。
+        try:
+            if self._poll_memory_bridge():
+                return
+        except Exception:
+            pass
         state = self.store.get_state()
         if state['counter'] != self.last_ws_counter:
             self.last_ws_counter = state['counter']
@@ -3128,6 +3144,62 @@ class PetWindow(QWidget):
                 self._pending_ws = None
                 self._ws_last_at = 0.0
                 self._ws_turn_t0 = 0.0
+
+    # ================== 记忆外挂（可选功能）==================
+    # 设计原则：与核心功能完全解耦。
+    #   · 记忆模式关闭（默认）：_poll_memory_bridge 立刻返回 False，
+    #     下面所有原生逻辑（工作状态映射、随机动作链、碎碎念定时器）一行都不变。
+    #   · 记忆模式开启：灵魂（DSH 插件）全权决定「播什么动作 + 说什么话」，
+    #     原生 _fire_whisper 定时器停掉让位，工作状态映射也不再抢占。
+    #   · 外挂目录被删 / store 没有对应方法 / 灵魂没在跑 → 全部走 except，桌宠照常。
+    def _poll_memory_bridge(self):
+        """处理灵魂推来的指令。返回 True 表示记忆模式已接管，原生逻辑本次跳过。"""
+        store = self.store
+        if not hasattr(store, 'get_memory_mode'):
+            return False                    # 旧版 store，没有记忆外挂
+        on = bool(store.get_memory_mode())
+
+        # 模式切换：进记忆模式停原生碎碎念定时器，退出时恢复
+        if on != getattr(self, '_memory_mode_on', None):
+            self._memory_mode_on = on
+            try:
+                if on:
+                    self._whisper_timer.stop()
+                else:
+                    self.schedule_whisper()
+            except Exception:
+                pass
+
+        if not on:
+            return False
+
+        # 取一条待播指令（取完即清，同一句不会重复播）
+        payload, _ = store.take_say()
+        if payload:
+            anim = (payload.get('anim') or '').strip()
+            text = (payload.get('text') or '').strip()
+            dur = payload.get('duration') or 12000
+            try:
+                dur = int(dur)
+            except Exception:
+                dur = 12000
+            # 动作：必须是 frames/ 下真实存在的目录，否则只说话不动
+            if anim and (self.base_dir / anim).exists():
+                self._memory_say(anim, text, dur)
+            elif text:
+                self.bubble.show_message(getattr(self, 'pet_label', "大肥鱼"), text, dur)
+            # 接管期间把状态位清干净，避免退出记忆模式后残留工作态
+            self._ws_state = None
+            self._ws_anim = ""
+            self._pending_ws = None
+        return True
+
+    def _memory_say(self, anim, text, duration_ms):
+        """播指定动画 + 弹气泡。走 force_action 的排队机制，不 hard-cut。"""
+        if text:
+            self.force_action(anim, msg=text, interrupt=False)
+        else:
+            self.force_action(anim, interrupt=False)
 
     def closeEvent(self, event):
         # ★ 先在主线程拆掉 QTimer 与解码等待队列，再收线程、关窗口：
@@ -3245,6 +3317,17 @@ class PetWindow(QWidget):
         except Exception:
             # 开关是可选功能，任何异常都不该影响菜单弹出；整栏空着就藏掉
             skills_menu.menuAction().setVisible(False)
+        # ---- 记忆外挂（可选功能）：单独一项，整块包 try/except ----
+        # 模块从 <工程根>/记忆外挂/memory_toggle.py 动态加载，**不在 src/ 里**。
+        # 外挂目录删掉 → 加载失败 → 这一项不出现，其余菜单照常。
+        try:
+            mt = self._load_memory_toggle()
+            act_mem = skills_menu.addAction(mt.menu_label())
+            act_mem.setEnabled(bool(mt.is_installed()
+                                    and getattr(self, 'is_main', False)))
+            act_mem.triggered.connect(self.toggle_memory)
+        except Exception:
+            pass
         size_menu = menu.addMenu("大小")
         size_opts = [("迷你", 0.3), ("小", 0.45), ("中", 0.6), ("标准", 0.75), ("大", 1.0), ("特大", 1.4), ("自适应", 0.0)]
         from PySide6.QtGui import QActionGroup
@@ -3302,6 +3385,64 @@ class PetWindow(QWidget):
                     "已恢复普通模式，不会再自动追问")
         except Exception as e:
             self.bubble.show_message("技能开关不可用", str(e))
+
+    # ================== 记忆外挂加载（可选功能）==================
+    # 外挂目录：<工程根>/记忆外挂/ ，与「技能外挂」同一范式：
+    #   · 完全解耦，删掉整个目录桌宠照常跑；
+    #   · 本文件只在两处碰它：右键菜单加一项、poll_state 里调 _poll_memory_bridge；
+    #     两处都整块包 try/except。
+    #   · 加载用 importlib 从**绝对路径**读，所以外挂不在 src/ 里也能被找到。
+    def _memory_bridge_dir(self):
+        """记忆外挂目录（工程根下的 `记忆外挂/`）。不存在返回 None。"""
+        try:
+            root = Path(self.base_dir).parent
+            d = root / '记忆外挂'
+            return d if d.is_dir() else None
+        except Exception:
+            return None
+
+    def _load_memory_toggle(self):
+        """动态加载 <工程根>/记忆外挂/memory_toggle.py，带缓存。
+
+        加载失败（目录被删 / 文件语法错）直接抛异常，由调用方 except 吃掉。
+        """
+        cached = getattr(self, '_memory_toggle_mod', None)
+        if cached is not None:
+            return cached
+        d = self._memory_bridge_dir()
+        if d is None:
+            raise ImportError('记忆外挂目录不存在')
+        path = d / 'memory_toggle.py'
+        if not path.is_file():
+            raise ImportError('memory_toggle.py 不存在')
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('pet_memory_toggle', str(path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self._memory_toggle_mod = mod
+        return mod
+
+    def toggle_memory(self):
+        """切换「记忆模式」并在气泡里反馈。
+
+        记忆模式开启后：
+          · 灵魂（DSH 插件）接管动作与气泡，原生 _fire_whisper 定时器停掉；
+          · 桌宠只负责播，不做任何决策。
+        关闭后恢复纯观赏的原生行为。
+        """
+        try:
+            mt = self._load_memory_toggle()
+            on = mt.toggle(self.store)
+            if on:
+                self.bubble.show_message(
+                    "记忆模式已开启",
+                    "现在由记忆层接管：会记得你说过的话，也会自己找你说话")
+            else:
+                self.bubble.show_message(
+                    "记忆模式已关闭",
+                    "已恢复纯观赏模式，不再记录也不再主动说话")
+        except Exception as e:
+            self.bubble.show_message("记忆开关不可用", str(e))
 
     def toggle_dsh(self):
         """DSH 在运行 → 彻底结束进程；没运行 → 启动。"""
@@ -4113,6 +4254,10 @@ class PetWindow(QWidget):
             pass
 
     def _fire_whisper(self):
+        # 记忆模式开启时原生碎碎念让位给灵魂：这里直接不播，也不再续命。
+        # 退出记忆模式时 _poll_memory_bridge 会重新 schedule_whisper()。
+        if getattr(self, '_memory_mode_on', False):
+            return
         ws = self.raw_anims.get('events', {}).get('whisper', []) or []
         if ws and not self.drag_on:
             try:

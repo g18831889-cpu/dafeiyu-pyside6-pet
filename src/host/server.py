@@ -2,10 +2,19 @@
 import sys
 import threading
 import json
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class StateStore:
+    # 记忆模式的"租约"时长（秒）。
+    #
+    # ★ 为什么是租约而不是开关：灵魂（DSH 插件）可能崩溃、被卸载、或 DSH 直接退出，
+    #   而桌宠是**独立进程**，它不知道对方已经没了。若只用一个布尔开关，
+    #   灵魂一旦掉线，桌宠就永远停在记忆模式里 —— 原生碎碎念已停、又没人说话，
+    #   表现是"桌宠变哑巴"。租约到期自动交还，最坏情况只是哑一会儿。
+    MEMORY_LEASE_SEC = 90
+
     def __init__(self):
         self.lock = threading.Lock()
         self.counter = 0
@@ -13,7 +22,16 @@ class StateStore:
         # 余额快照：由 DSH 插件（dsh-pet-pyside6）推过来的 type='balance' 事件写入。
         # 独立模式下没人推 → 保持 None，菜单会走"未连接"分支而不是伪造数字。
         self.balance = None
-        
+        # ---- 记忆外挂（可选功能，与核心完全解耦）----
+        # 「灵魂」插件通过 POST /say 推来 {anim, text, duration}，这里只存快照。
+        # say_counter 每次递增，window.poll_state 靠它判断"有新指令"。
+        # 没人推 → 永远 0，桌宠行为与没有本功能时完全一致。
+        self.say_data = None
+        self.say_counter = 0
+        # 记忆模式：开启后原生 _fire_whisper 定时器让位给灵魂驱动。
+        # 存的是**到期时间戳**（0 = 未开启），不是布尔值。
+        self.memory_until = 0.0
+
     def set_status(self, status_idx):
         with self.lock:
             if self.work_status != status_idx:
@@ -31,6 +49,63 @@ class StateStore:
     def get_state(self):
         with self.lock:
             return {"counter": self.counter, "workStatus": self.work_status}
+
+    # ---- 记忆外挂相关（可选；不调用则零影响）----
+    def set_say(self, payload):
+        """灵魂推来一条「动作 + 话」。只存快照，由 poll_state 消费。"""
+        with self.lock:
+            self.say_data = payload
+            self.say_counter += 1
+            # 说话即视为灵魂活着，顺手续租：正常对话期间不用额外心跳
+            if self.memory_until:
+                self.memory_until = time.time() + self.MEMORY_LEASE_SEC
+
+    def take_say(self):
+        """取走待播指令（取完即清，避免同一句重复播）。
+
+        返回 (payload, counter)；payload 为 None 表示没有新指令。
+        """
+        with self.lock:
+            if self.say_data is None:
+                return None, self.say_counter
+            payload = self.say_data
+            self.say_data = None
+            return payload, self.say_counter
+
+    def set_memory_mode(self, on, lease_sec=None):
+        """开启/关闭记忆模式。开启时带租约，到期自动失效。"""
+        with self.lock:
+            if not on:
+                self.memory_until = 0.0
+                return
+            sec = self.MEMORY_LEASE_SEC if lease_sec is None else max(1, int(lease_sec))
+            self.memory_until = time.time() + sec
+
+    def renew_memory_lease(self, lease_sec=None):
+        """续租（灵魂心跳用）。未开启时不隐式开启，返回 False。"""
+        with self.lock:
+            if not self.memory_until:
+                return False
+            sec = self.MEMORY_LEASE_SEC if lease_sec is None else max(1, int(lease_sec))
+            self.memory_until = time.time() + sec
+            return True
+
+    def get_memory_mode(self):
+        """当前是否处于记忆模式（已考虑租约过期）。"""
+        with self.lock:
+            if not self.memory_until:
+                return False
+            if time.time() > self.memory_until:
+                self.memory_until = 0.0   # 惰性过期
+                return False
+            return True
+
+    def memory_lease_left(self):
+        """剩余租约秒数（未开启返回 0）。"""
+        with self.lock:
+            if not self.memory_until:
+                return 0
+            return max(0, int(self.memory_until - time.time()))
 
 store = StateStore()
 
@@ -135,6 +210,17 @@ class DSHHandler(BaseHTTPRequestHandler):
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             self.wfile.write(json.dumps(data).encode('utf-8'))
+        elif self.path == '/say':
+            # 调试用：看当前待播指令与记忆模式状态（不消费，不影响播放）
+            body = json.dumps({'pending': store.say_data,
+                               'counter': store.say_counter,
+                               'memoryMode': store.get_memory_mode()},
+                              ensure_ascii=False).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self.send_response(404)
             self.end_headers()
@@ -145,6 +231,66 @@ class DSHHandler(BaseHTTPRequestHandler):
             store.set_status(None)
             body = b'{"ok":true}'
             self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        # ---- 记忆外挂（可选）：/say 与 /memory-mode ----
+        # 记忆外挂删掉后这两个端点无人调用，桌宠行为与原来完全一致。
+        if self.path == '/say':
+            length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(length)
+            try:
+                data = json.loads(post_data.decode('utf-8'))
+                anim = data.get('anim') or ''
+                text = data.get('text') or ''
+                try:
+                    duration = int(data.get('duration') or 12000)
+                except Exception:
+                    duration = 12000
+                store.set_say({'anim': anim, 'text': text, 'duration': duration})
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}')
+            except Exception as e:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(str(e).encode('utf-8'))
+            return
+        if self.path == '/memory-mode':
+            length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(length)
+            try:
+                data = json.loads(post_data.decode('utf-8'))
+                lease = data.get('leaseSec')
+                store.set_memory_mode(data.get('on'), lease)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps(
+                    {'ok': True,
+                     'memoryMode': store.get_memory_mode(),
+                     'leaseLeft': store.memory_lease_left()}).encode('utf-8'))
+            except Exception as e:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(str(e).encode('utf-8'))
+            return
+        # 续租：灵魂心跳调用。未开启时不隐式开启（避免"幽灵接管"）。
+        if self.path == '/memory-renew':
+            length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(length)
+            try:
+                data = json.loads(post_data.decode('utf-8')) if post_data else {}
+            except Exception:
+                data = {}
+            ok = store.renew_memory_lease(data.get('leaseSec'))
+            body = json.dumps({'ok': ok,
+                               'memoryMode': store.get_memory_mode(),
+                               'leaseLeft': store.memory_lease_left()}).encode('utf-8')
+            self.send_response(200 if ok else 409)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(body)))
             self.end_headers()
