@@ -68,7 +68,14 @@ def main():
     config_data = load_config(base_dir, config_file)
     
     if args.mode == 'standalone':
-        # 单实例：3080 已被占用说明已有实例在跑，本次不再起第二只
+        # 单实例：**先检测有没有实体在跑，再决定是否创建**。
+        #   ① 主动探测 3080：能应答 /state 说明已有实例活着 → 直接退出，连窗口都不建。
+        #   ② 探测可能误判（对方正忙/超时），所以再用**独占绑定**兜底：
+        #      ExclusiveHTTPServer 在端口被占时会直接抛 10048，绑不上就说明确实有实例。
+        #   两道闸任意一道命中都不重复创建。
+        if probe_instance(3080):
+            print('[Main] 检测到已有实例在运行，本次不重复启动。', file=sys.stderr, flush=True)
+            sys.exit(0)
         if not start_http_server(3080):
             print('[Main] 已有实例在运行（端口 3080 被占用），本次不重复启动。', file=sys.stderr, flush=True)
             sys.exit(0)

@@ -1,5 +1,6 @@
 """src/host/server.py - 双模通信服务端（HTTP / stdio）"""
 import sys
+import socket
 import threading
 import json
 import time
@@ -38,6 +39,15 @@ class StateStore:
         #   让它按**差值**结算摸头次数，就不用新开端口、不用改协议。
         #   没人单击 → 永远 0，与没有本功能时完全一致。
         self.pet_counter = 0
+        # 对话端口：灵魂接管时把它自己的 /chat 端口告诉我们（POST /memory-mode 的 chatPort）。
+        # 点「技能 ▸ 对话」时才知道往哪儿发。0 = 还没连上，菜单项置灰。
+        self.chat_port = 0
+        # 对话结果：/chat 在后台线程里等模型，回来塞这里，window.poll_state 取走弹气泡。
+        # ★ 为什么不在 /chat 处理器里直接弹：那会在 HTTP 线程里操作 Qt，必崩。
+        self.chat_result = None
+        self.chat_counter = 0
+        # 对话进行中标记（防止连点两次弹两个输入框）
+        self.chat_busy = False
 
     def set_status(self, status_idx):
         with self.lock:
@@ -90,9 +100,19 @@ class StateStore:
             self.say_data = None
             return payload, self.say_counter
 
-    def set_memory_mode(self, on, lease_sec=None):
-        """开启/关闭记忆模式。开启时带租约，到期自动失效。"""
+    def set_memory_mode(self, on, lease_sec=None, chat_port=None):
+        """开启/关闭记忆模式。开启时带租约，到期自动失效。
+
+        chat_port：灵魂的 /chat 端口。接管时顺手告诉我们，省一次握手。
+        """
         with self.lock:
+            if chat_port is not None:
+                try:
+                    cp = int(chat_port)
+                    if cp > 0:
+                        self.chat_port = cp
+                except (TypeError, ValueError):
+                    pass
             if not on:
                 self.memory_until = 0.0
                 return
@@ -124,6 +144,39 @@ class StateStore:
             if not self.memory_until:
                 return 0
             return max(0, int(self.memory_until - time.time()))
+
+    # ---- 对话（可选；没人点菜单就零影响）----
+    def set_chat_result(self, payload):
+        """后台线程把模型回复塞进来。只存快照，由 poll_state 消费。"""
+        with self.lock:
+            self.chat_result = payload
+            self.chat_counter += 1
+            self.chat_busy = False
+
+    def take_chat_result(self):
+        """取走对话结果（取完即清）。返回 (payload, counter)。"""
+        with self.lock:
+            if self.chat_result is None:
+                return None, self.chat_counter
+            payload = self.chat_result
+            self.chat_result = None
+            return payload, self.chat_counter
+
+    def get_chat_port(self):
+        with self.lock:
+            return self.chat_port
+
+    def begin_chat(self):
+        """标记对话开始。已在对话中返回 False（防止连点弹两个输入框）。"""
+        with self.lock:
+            if self.chat_busy:
+                return False
+            self.chat_busy = True
+            return True
+
+    def is_chat_busy(self):
+        with self.lock:
+            return self.chat_busy
 
 store = StateStore()
 
@@ -180,9 +233,58 @@ def process_event(data):
             pass
         store.set_balance(data.get('data') if isinstance(data.get('data'), dict) else data)
 
+def spawn_chat(store, port, text):
+    """后台线程请求灵魂的 /chat，结果塞进 store。
+
+    抽成模块级函数是为了让 window.py（右键菜单「对话」）也能直接用，
+    不必绕一圈 HTTP 打自己。
+
+    ★ 三条纪律：
+      1. 绝不阻塞调用方线程（模型要 1~3 秒）
+      2. 失败也要给结果（气泡显示"我有点懵"），否则主人以为她没听见
+      3. 异常一律吞掉——对话坏了不该拖垮桌宠主进程
+    """
+    def worker():
+        try:
+            payload = json.dumps({'text': text}).encode('utf-8')
+            req = urllib.request.Request(
+                f'http://127.0.0.1:{port}/plugins/dsh-pet-memory/chat',
+                data=payload,
+                headers={'Content-Type': 'application/json'},
+                method='POST')
+            # 模型最多 30 秒，这里给 35 秒余量
+            with urllib.request.urlopen(req, timeout=35) as resp:
+                raw = resp.read().decode('utf-8', 'replace')
+            try:
+                out = json.loads(raw)
+            except Exception:
+                out = {'ok': False, 'text': '我有点懵…'}
+            store.set_chat_result({
+                'ok': bool(out.get('ok')),
+                'text': str(out.get('text') or ''),
+                'anim': str(out.get('anim') or ''),
+            })
+        except Exception as e:
+            try:
+                store.set_chat_result({
+                    'ok': False,
+                    'text': '我有点懵…再说一次？',
+                    'anim': '',
+                    'error': str(e),
+                })
+            except Exception:
+                pass
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+
 class DSHHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args): pass
-        
+
+    def _spawn_chat(self, port, text):
+        spawn_chat(store, port, text)
+
     def do_GET(self):
         if self.path == '/balance':
             # 调试：直接看 store 里最新的余额快照
@@ -283,14 +385,48 @@ class DSHHandler(BaseHTTPRequestHandler):
             try:
                 data = json.loads(post_data.decode('utf-8'))
                 lease = data.get('leaseSec')
-                store.set_memory_mode(data.get('on'), lease)
+                store.set_memory_mode(data.get('on'), lease, data.get('chatPort'))
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps(
                     {'ok': True,
                      'memoryMode': store.get_memory_mode(),
-                     'leaseLeft': store.memory_lease_left()}).encode('utf-8'))
+                     'leaseLeft': store.memory_lease_left(),
+                     'chatPort': store.get_chat_port()}).encode('utf-8'))
+            except Exception as e:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(str(e).encode('utf-8'))
+            return
+        # 对话：把主人这句话转给灵魂（DSH 插件的 /chat），结果异步塞进 store。
+        # ★ 必须在后台线程里发请求：模型要 1~3 秒，阻塞 HTTP 线程会让
+        #   poll_state 拿不到数据、整个桌宠卡住。
+        if self.path == '/chat':
+            length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(length)
+            try:
+                data = json.loads(post_data.decode('utf-8'))
+                text = (data.get('text') or '').strip()
+                if not text:
+                    raise ValueError('empty text')
+                port = store.get_chat_port()
+                if not port:
+                    body = json.dumps({'ok': False, 'error': 'chat port not set'}).encode('utf-8')
+                    self.send_response(409)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                # 立刻回 202：告诉调用方"收到了，等气泡"
+                body = json.dumps({'ok': True, 'accepted': True}).encode('utf-8')
+                self.send_response(202)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self._spawn_chat(port, text)
             except Exception as e:
                 self.send_response(400)
                 self.end_headers()
@@ -352,9 +488,37 @@ def probe_instance(port=3080, timeout=0.6):
         return False
 
 
+class ExclusiveHTTPServer(HTTPServer):
+    """独占端口的 HTTPServer —— 端口已被别的进程占用时**绑定失败**。
+
+    ★ 为什么必须自己写这个类：
+      标准库 `HTTPServer.allow_reuse_address` 默认是 True（Windows 上等价于
+      SO_REUSEADDR）。Windows 的 SO_REUSEADDR 语义与 Linux 完全不同 —— 它允许
+      **另一个进程直接绑上一个正在被监听的端口**，且不报错。于是：
+        · 第二只桌宠能绑上 3080，`start_http_server` 返回 True，单实例闸形同虚设；
+        · 更糟的是连接仍然全部路由给**先绑的那个**（实测 10/10），
+          第二只鱼既收不到 DSH 事件、又抢不到端口，变成一只"空壳鱼"。
+      所以这里做两件事：
+        1. `allow_reuse_address = False`（不再主动设置 SO_REUSEADDR）；
+        2. 绑之前先设 `SO_EXCLUSIVEADDRUSE`（Windows 专有，语义是"只有我能用"），
+           这样端口被占时 bind 会抛 WinError 10048，调用方立刻知道"已有实例"。
+      `SO_EXCLUSIVEADDRUSE` 不会被 TIME_WAIT 挡住（已实测：关闭后立即独占重绑成功），
+      所以不影响桌宠正常退出后马上重启。
+    """
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except OSError:
+                pass
+        super().server_bind()
+
+
 def start_http_server(port=3080):
     try:
-        server = HTTPServer(('127.0.0.1', port), DSHHandler)
+        server = ExclusiveHTTPServer(('127.0.0.1', port), DSHHandler)
     except OSError as e:
         # 端口被占：几乎一定是另一个实例已经在跑。进程自己不要崩，交给调用方决定。
         print(f"[Server] 端口 {port} 已被占用（可能已有实例在运行）：{e}", file=sys.stderr, flush=True)

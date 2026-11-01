@@ -3184,6 +3184,27 @@ class PetWindow(QWidget):
         if not on:
             return False
 
+        # 对话结果（/chat 的后台线程塞进来的）：优先于普通指令播，
+        # 因为主人刚问完一句，等的是这句话的回应。
+        try:
+            chat = store.take_chat_result()
+            if chat and isinstance(chat, tuple):
+                chat = chat[0]
+            if chat:
+                ctext = (chat.get('text') or '').strip()
+                canim = (chat.get('anim') or '').strip()
+                if ctext or canim:
+                    if canim and (self.base_dir / canim).exists():
+                        self.force_action(canim, msg=ctext, interrupt=False)
+                    elif ctext:
+                        self.bubble.show_message(getattr(self, 'pet_label', "大肥鱼"), ctext, 12000)
+                    self._ws_state = None
+                    self._ws_anim = ""
+                    self._pending_ws = None
+                    return True
+        except Exception:
+            pass
+
         # 取一条待播指令（取完即清，同一句不会重复播）
         payload, _ = store.take_say()
         if payload:
@@ -3337,6 +3358,17 @@ class PetWindow(QWidget):
             act_mem.setEnabled(bool(mt.is_installed()
                                     and getattr(self, 'is_main', False)))
             act_mem.triggered.connect(self.toggle_memory)
+            # 「对话」：只在记忆模式开着、且灵魂给过 chatPort 时才可用。
+            # 记忆模式没开就没有灵魂在听，弹输入框也只会得到"我有点懵"。
+            act_chat = skills_menu.addAction("对话")
+            try:
+                _on = bool(self.store.get_memory_mode()) if self.store else False
+                _port = self.store.get_chat_port() if self.store else 0
+            except Exception:
+                _on, _port = False, 0
+            act_chat.setEnabled(bool(_on and _port
+                                     and getattr(self, 'is_main', False)))
+            act_chat.triggered.connect(self.open_chat_dialog)
         except Exception:
             pass
         size_menu = menu.addMenu("大小")
