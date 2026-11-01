@@ -308,6 +308,45 @@ def _pid_exe_name(pid):
     return name
 
 
+def _pid_exe_path(pid):
+    """取进程的**完整 exe 路径**。失败返回 ''。
+
+    与 `_pid_exe_name` 同一套 API，只是不截断目录部分 ——
+    唤起隐藏的 DSH 时要重新启动它，必须拿到完整路径。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+    h = None
+    try:
+        h = kernel32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if h:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(1024)
+            if kernel32.QueryFullProcessImageNameW(wintypes.HANDLE(h), 0, buf,
+                                                   ctypes.byref(size)):
+                return buf.value or ""
+    except Exception:
+        pass
+    finally:
+        try:
+            if h:
+                kernel32.CloseHandle(wintypes.HANDLE(h))
+        except Exception:
+            pass
+    return ""
+
+
+def _dsh_exe_from_running():
+    """从正在运行的 DSH 进程反查它的 exe 完整路径。找不到返回 ''。"""
+    for pid in _iter_dsh_pids():
+        p = _pid_exe_path(pid)
+        if p and p.lower().endswith(_DSH_EXE_NAME.lower()):
+            return p
+    return ""
+
+
 def _iter_dsh_pids_via_windows():
     """枚举顶层窗口 → 反查所属进程 exe 名 → 收集 DSH 的 PID。
 
@@ -539,6 +578,166 @@ def _enum_dsh_hidden_windows():
     return found
 
 
+_RELAUNCH_GUARD = {"at": 0.0}
+
+
+def _relaunch_dsh_to_show():
+    """让 DSH **主进程自己**把窗口显示出来 —— 重新启动一次 DSH.exe。
+
+    ★ 为什么必须这么做（2026-11-01 实测定案）：
+      用户点 × 进托盘时，Electron 走 `window.on("close")` →
+      `event.preventDefault()` → `hideMainWindow(window)` → `window.hide()`。
+      此后 Chromium 内部 `isVisible === false`，**合成器停止提交新帧**。
+      外部调 `ShowWindow(SW_SHOW)` 只改 Win32 的 `WS_VISIBLE`，
+      Chromium 毫不知情 → 窗口能拖动、能点，但画面永久定格。
+      实测：隐藏后 ShowWindow，窗口区域像素 24 秒零变化；
+            重新启动 exe 后 321ms 内变可见且画面正常。
+
+    ★ 为什么重启 exe 就能修：
+      DSH 有单实例锁。新进程抢锁失败 → 立即 `app.quit()`；
+      **原进程**收到 `second-instance` 事件 → `focusPrimaryWindow()` →
+      `window.show()` + `window.focus()`。全程在 DSH 进程内，
+      Chromium 内部状态正确同步 —— 与用户点托盘图标、双击桌面快捷方式同一条路。
+
+    ★★ 必须剔除 `ELECTRON_*` 环境变量：
+      桌宠若由 DSH 插件拉起，会继承 `ELECTRON_RUN_AS_NODE=1`，
+      它让 Electron 以纯 Node 模式运行（不建 GUI）并立即退出，
+      根本不发 second-instance → 窗口不出现。与 `open_dsh()` 里同源。
+
+    返回是否真的启动了进程。
+    """
+    import os
+    import subprocess
+    import time as _time
+
+    # ★ 防抖：2 秒内重复触发只启动一次。
+    #   多开时每只都能双击，若不防抖会连开好几个 DSH 进程（都会抢锁失败退出，
+    #   无害但浪费；且第 2 个起就抢不到锁了，纯噪音）。
+    _now = _time.monotonic()
+    if _now - _RELAUNCH_GUARD["at"] < 2.0:
+        dsh_log("relaunch_to_show: %.2fs 内已启动过，跳过" % (_now - _RELAUNCH_GUARD["at"]))
+        return True                      # 视为"已经在处理"，让调用方走异步等待
+    _RELAUNCH_GUARD["at"] = _now
+
+    exe = ""
+    try:
+        exe = _dsh_exe_from_running()
+    except Exception:
+        exe = ""
+    if not exe:
+        # 退一步：从用户绑定的路径取（与「打开 DSH」同一个来源）
+        try:
+            from src.host import user_settings
+            root = os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))))
+            bound = user_settings.load(root).get("dsh_exe")
+            if isinstance(bound, str) and bound and os.path.isfile(bound):
+                exe = bound
+        except Exception:
+            exe = ""
+    if not exe or not os.path.isfile(exe):
+        dsh_log("relaunch_to_show: 找不到 DSH.exe，无法自唤醒")
+        return False
+
+    env = dict(os.environ)
+    removed = [k for k in list(env) if k.upper().startswith("ELECTRON")]
+    for k in removed:
+        env.pop(k, None)
+
+    try:
+        proc = subprocess.Popen(
+            [exe], cwd=os.path.dirname(exe), env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        dsh_log("relaunch_to_show: Popen 失败 %r" % (e,))
+        return False
+
+    dsh_log("relaunch_to_show: 已启动 pid=%s 剔除环境变量=%r exe=%r"
+            % (getattr(proc, "pid", "?"), removed, exe))
+    return True
+
+
+def _raise_foreground(user32, wintypes, hwnd):
+    """把已经可见的窗口提到最前（不含显示逻辑）。"""
+    import ctypes
+    try:
+        user32.SetForegroundWindow(wintypes.HWND(hwnd))
+    except Exception:
+        pass
+    try:
+        if int(user32.GetForegroundWindow() or 0) == hwnd:
+            return True
+    except Exception:
+        pass
+    # AttachThreadInput 挂到当前前台线程
+    try:
+        kernel32 = ctypes.windll.kernel32
+        cur_tid = kernel32.GetCurrentThreadId()
+        fg = int(user32.GetForegroundWindow() or 0)
+        fg_tid = user32.GetWindowThreadProcessId(wintypes.HWND(fg), None) if fg else 0
+        attached = False
+        if fg_tid and fg_tid != cur_tid:
+            attached = bool(user32.AttachThreadInput(cur_tid, fg_tid, True))
+        try:
+            user32.BringWindowToTop(wintypes.HWND(hwnd))
+            user32.SetForegroundWindow(wintypes.HWND(hwnd))
+            user32.SetActiveWindow(wintypes.HWND(hwnd))
+        finally:
+            if attached:
+                user32.AttachThreadInput(cur_tid, fg_tid, False)
+    except Exception:
+        pass
+    try:
+        return int(user32.GetForegroundWindow() or 0) == hwnd
+    except Exception:
+        return False
+
+
+def _schedule_foreground_when_visible(hwnd, tries=40, interval_ms=50):
+    """异步轮询：等 DSH 窗口变可见后再把它提到最前。
+
+    ★ 为什么异步：本函数由双击触发，跑在 Qt 主线程里。
+      同步 sleep 等待会让桌宠动画冻结（最多 1 秒，肉眼可见的卡顿）。
+      用 QTimer 每 50ms 探一次，共 2 秒，全程不阻塞事件循环。
+
+    ★ 为什么每次重新枚举窗口：`window.show()` 之后句柄通常不变，
+      但极端情况下（欢迎窗 → 主窗切换）会换。重新枚举更稳。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    state = {"n": 0}
+
+    def _tick():
+        state["n"] += 1
+        target = 0
+        try:
+            vis = _enum_dsh_main_windows()
+            if vis:
+                fg = int(user32.GetForegroundWindow() or 0)
+                cand = next((w[0] for w in vis if w[0] == fg), vis[0][0])
+                if user32.IsWindowVisible(wintypes.HWND(cand)):
+                    target = cand
+        except Exception:
+            target = 0
+
+        if target:
+            _raise_foreground(user32, wintypes, target)
+            dsh_log("异步提前台: 第 %d 次探测时 DSH 已可见，已提到最前 %#x"
+                    % (state["n"], target))
+            return                    # 不再重排
+
+        if state["n"] < tries:
+            QTimer.singleShot(interval_ms, _tick)
+        else:
+            dsh_log("异步提前台: %d 次探测（%.1fs）内 DSH 仍未可见，放弃"
+                    % (tries, tries * interval_ms / 1000.0))
+
+    QTimer.singleShot(interval_ms, _tick)
+
+
 def bring_dsh_to_front():
     """把 DSH 主窗口**提到最前**，让用户能直接看到它（必要时先还原最小化）。
 
@@ -607,14 +806,43 @@ def bring_dsh_to_front():
     hwnd, title, _mini = target
 
     # ---------- 2) 还原 / 显示 ----------
-    # ★ 为什么不能只靠 ShowWindow：
-    #   实测（2026-10-29）跨进程调 ShowWindow 会被系统拒绝并返回 0 / GetLastError=5，
-    #   窗口一动不动；而 PostMessage(WM_SYSCOMMAND, SC_RESTORE) 能正常还原。
-    #   所以这里"先 ShowWindow，再用 IsIconic/IsWindowVisible 复核，没成就走消息兜底"。
     SW_RESTORE = 9
     SW_SHOW = 5
     WM_SYSCOMMAND = 0x0112
     SC_RESTORE = 0xF120
+
+    # ★★ 隐藏（点 × 进托盘）状态：**重新启动 DSH.exe**，不要用 ShowWindow。
+    #
+    # 根因（2026-11-01 实测定案）：
+    #   用户点 × 时 Electron 走 `window.on("close")` → `event.preventDefault()`
+    #   → `hideMainWindow(window)` → `window.hide()`。此后 Chromium 内部
+    #   `isVisible === false`，**合成器停止提交新帧**。
+    #   外部进程调 `ShowWindow(SW_SHOW)` 只改 Win32 层的 WS_VISIBLE，
+    #   Chromium 完全不知情 → 窗口能拖动、能点，但画面永久定格在最后一帧。
+    #   实测：隐藏后 ShowWindow，窗口区域像素 24 秒零变化（真冻结）；
+    #        重新启动 exe 后立刻恢复（321ms 内变可见且画面正常）。
+    #
+    # 为什么重启 exe 能修：
+    #   DSH 有单实例锁（`claimDesktopSingleInstance`）。新进程抢锁失败 →
+    #   `app.quit()`；**原进程**收到 `second-instance` 事件 →
+    #   `focusPrimaryWindow()` → `window.show()` + `window.focus()`。
+    #   全程在 DSH 进程内执行，Chromium 内部状态正确同步 ——
+    #   与用户点托盘图标、双击桌面快捷方式走的是同一条路径。
+    #
+    # ★ 坑：启动时**必须剔除 ELECTRON_* 环境变量**。
+    #   桌宠若由 DSH 插件拉起，会继承 `ELECTRON_RUN_AS_NODE=1`，
+    #   该变量让 Electron 以纯 Node 模式运行（不建 GUI 窗口）并立即退出，
+    #   根本不发 second-instance → 窗口不出现。这与 `open_dsh()` 里同源。
+    if was_hidden:
+        if _relaunch_dsh_to_show():
+            # ★ 不在主线程里 sleep 等窗口出现 —— 那会让桌宠动画卡住最多 1 秒。
+            #   改成用 QTimer 异步轮询，DSH 一可见就提前台。
+            _schedule_foreground_when_visible(hwnd)
+            return True, title
+        # 启动失败（找不到 exe / Popen 异常）→ 落到下面的 ShowWindow 兜底，
+        # 至少让窗口可见（画面可能仍冻结，但好过完全没反应）。
+        dsh_log("bring_dsh_to_front: 自唤醒失败，回退 ShowWindow（画面可能冻结）")
+
     _cmd = SW_SHOW if was_hidden else SW_RESTORE
 
     for fn in ("ShowWindow", "ShowWindowAsync"):
