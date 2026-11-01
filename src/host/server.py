@@ -31,6 +31,13 @@ class StateStore:
         # 记忆模式：开启后原生 _fire_whisper 定时器让位给灵魂驱动。
         # 存的是**到期时间戳**（0 = 未开启），不是布尔值。
         self.memory_until = 0.0
+        # 「摸摸头」计数：单击桌宠时 +1，单调递增，永不重置。
+        #
+        # ★ 为什么是计数而不是事件：桌宠不能反向推事件给灵魂（/event 是
+        #   DSH→身体 单向通道），而灵魂本来就每 20 秒读一次 GET /state。
+        #   让它按**差值**结算摸头次数，就不用新开端口、不用改协议。
+        #   没人单击 → 永远 0，与没有本功能时完全一致。
+        self.pet_counter = 0
 
     def set_status(self, status_idx):
         with self.lock:
@@ -48,7 +55,18 @@ class StateStore:
                 
     def get_state(self):
         with self.lock:
-            return {"counter": self.counter, "workStatus": self.work_status}
+            return {
+                "counter": self.counter,
+                "workStatus": self.work_status,
+                # 灵魂每 20 秒读一次，按差值结算摸头
+                "petCounter": self.pet_counter,
+            }
+
+    def bump_pet(self):
+        """单击桌宠 → 摸头 +1。只记账，不改任何原生行为。"""
+        with self.lock:
+            self.pet_counter += 1
+            return self.pet_counter
 
     # ---- 记忆外挂相关（可选；不调用则零影响）----
     def set_say(self, payload):
@@ -291,6 +309,17 @@ class DSHHandler(BaseHTTPRequestHandler):
                                'memoryMode': store.get_memory_mode(),
                                'leaseLeft': store.memory_lease_left()}).encode('utf-8')
             self.send_response(200 if ok else 409)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == '/pet':
+            # 摸头 +1。正常路径是 window.py 单击时直接调 store.bump_pet()，
+            # 这个端点只为调试/外部脚本手动触发用（不改变任何原生行为）。
+            store.bump_pet()
+            body = json.dumps({'ok': True, 'petCounter': store.get_state()['petCounter']}).encode('utf-8')
+            self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(body)))
             self.end_headers()

@@ -2876,6 +2876,17 @@ class PetWindow(QWidget):
                     if self._balance_available():
                         self._request_balance()
                         return
+                else:
+                    # ★ 单击（非双击）= 摸摸头。
+                    #   只把计数器 +1，**不做任何别的事**：灵魂（DSH 插件）每 20 秒
+                    #   读 GET /state 拿 petCounter，按差值结算催产素/皮质醇/饥渴。
+                    #   为什么不做成推事件：/event 是 DSH→身体 单向通道，反向推要改协议；
+                    #   而 /state 本来就存在，读它零成本。
+                    #   记忆外挂没装/没开时这个计数没人读，等于不存在。
+                    try:
+                        self.store.bump_pet()
+                    except Exception:
+                        pass
                 clicks = self.raw_anims.get('clicks', []) or []
                 if clicks:
                     self.force_action(random.choice(clicks), interrupt=True)
